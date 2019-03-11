@@ -41,7 +41,7 @@ class BNN(object):
   def __init__(self, n_iteration = 1050,
                n_batch = 32,
                n_eval = 50,
-               n_posterior = 1000,
+               n_posterior = 10000,
                variational_inference = False):
     '''
     Initialise the network.
@@ -107,7 +107,7 @@ class BNN(object):
     for i in sorted(self.var.keys()):
       kwargs[i] = param[c]
       c += 1
-    x,w,y = self.get_batch_train()
+    x,w,y = self.get_full_train()
     return self.log_joint(x, out = y[:,np.newaxis], **kwargs)
     #log_prob = 0
     #for x,w,y in self.get_batch():
@@ -287,6 +287,12 @@ class BNN(object):
     y_batch = self.file['train'][r, self.col_signal].astype(np.float32)
     return x_batch, x_batch_w, y_batch
 
+  def get_full_train(self):
+    x_batch = self.file['train'][:, self.col_data:].astype(np.float32)
+    x_batch_w = self.file['train'][:, self.col_weight].astype(np.float32)
+    y_batch = self.file['train'][:, self.col_signal].astype(np.float32)
+    return x_batch, x_batch_w, y_batch
+
   def train(self, prefix, result_dir, network_dir):
     N = len(self.file['train'])
 
@@ -296,8 +302,8 @@ class BNN(object):
 
     hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
                         target_log_prob_fn = self.target_log_prob_fn,
-                        step_size          = 0.1,
-                        num_leapfrog_steps = 5)
+                        step_size          = 0.001,
+                        num_leapfrog_steps = 10)
 
     dot = tf_to_dot(self.graph)
     dot.render('%s/graph.gv' % result_dir, view=False) 
@@ -361,6 +367,7 @@ class BNN(object):
     for i in sorted(self.posterior):
       self.posterior_mean[i] = np.mean(self.posterior[i], axis = 0)
       self.posterior_std[i] = np.std(self.posterior[i], axis = 0)
+
 
     def make_value_setter(**model_kwargs):
       """Creates a value-setting interceptor."""
