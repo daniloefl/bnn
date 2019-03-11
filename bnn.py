@@ -273,7 +273,7 @@ class BNN(object):
 
     first_state = []
     for i in sorted(self.var.keys()):
-      first_state.append(tf.zeros(self.var[i].shape, dtype = tf.float32))
+      first_state.append(tf.random.normal(mean = 0.0, stddev = 1.0, shape = self.var[i].shape, dtype = tf.float32))
 
     hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
                           target_log_prob_fn = self.target_log_prob_fn,
