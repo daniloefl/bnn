@@ -290,7 +290,7 @@ class BNN(object):
 
       graph = tf.get_default_graph()
       dot = tf_to_dot(graph)
-      dot.render('graph.gv', view=False) 
+      dot.render('%s/graph.gv' % result_dir, view=False) 
 
       states, kernel_results = tfp.mcmc.sample_chain(
                           num_results        = self.n_posterior,
