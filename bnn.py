@@ -103,9 +103,11 @@ class BNN(object):
     for i in sorted(self.var.keys()):
       kwargs[i] = param[c]
       c += 1
-    log_prob = 0
-    for x,w,y in self.get_batch():
-        log_prob += self.log_joint(x, out = y[:,np.newaxis], **kwargs)
+    x,w,y = self.get_batch_train()
+    return self.log_joint(x, out = y[:,np.newaxis], **kwargs)
+    #log_prob = 0
+    #for x,w,y in self.get_batch():
+    #    log_prob += self.log_joint(x, out = y[:,np.newaxis], **kwargs)
     return log_prob
 
   '''
@@ -306,15 +308,11 @@ class BNN(object):
 
       self.posterior, results_out = self.session.run([states, kernel_results])
 
-    print(self.posterior)
-
     c = 0
     for i in sorted(self.var.keys()):
       self.posterior_mean[i] = np.mean(self.posterior[c], axis = 0)
       self.posterior_std[i] = np.std(self.posterior[c], axis = 0)
       c += 1
-
-    print(results_out)
 
     def make_value_setter(**model_kwargs):
       """Creates a value-setting interceptor."""
@@ -329,8 +327,8 @@ class BNN(object):
     with ed.tape() as model_tape:
       setdir = {}
       for i in sorted(self.var.keys()):
-        setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], shape = self.var[i].shape, name = "q_%s" % i)
-      with ed.interception(make_value_setter(setdir)):
+        setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], name = "q_%s" % i)
+      with ed.interception(make_value_setter(**setdir)):
         self.posterior_predictive = self.model(self.input)
 
     self.save("%s/%s_discriminator" % (network_dir, prefix))
@@ -396,9 +394,9 @@ class BNN(object):
     with ed.tape() as model_tape:
       setdir = {}
       for i in sorted(self.var.keys()):
-        setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], shape = self.var[i].shape, name = "q_%s" % i)
-      with ed.interception(make_value_setter(setdir)):
-        self.posterior_predictive = self.model(self.input)
+        setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], name = "q_%s" % i)
+      with ed.interception(make_value_setter(**setdir)):
+        self.posterior_predictive = self.nnout
 
 def main():
   import argparse
