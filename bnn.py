@@ -23,6 +23,16 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow_probability import edward2 as ed
 
+from graphviz import Digraph
+
+def tf_to_dot(graph):
+    dot = Digraph()
+    for n in graph.as_graph_def().node:
+        dot.node(n.name, label=n.name)
+        for i in n.input:
+            dot.edge(i, n.name)
+    return dot
+
 class BNN(object):
   '''
   Implementation of a test BNN.
@@ -58,15 +68,18 @@ class BNN(object):
     dim_prev = self.n_dimensions
     if self.count > 1:
       dim_prev = self.var['b_%d' % (self.count-1)].shape[-1]
-    W = ed.Normal(loc = tf.zeros( (dim_prev, dim) ), scale = tf.ones( (dim_prev, dim) ), name = "W_%d" % self.count)
-    b = ed.Normal(loc = tf.zeros( (dim) ), scale = tf.ones( (dim) ), name = "b_%d" % self.count)
+    W = ed.Normal(loc = 0.0, scale = 1.0, sample_shape = (dim_prev, dim), name = "W_%d" % self.count)
+    b = ed.Normal(loc = 0.0, scale = 1.0, sample_shape = (dim), name = "b_%d" % self.count)
     self.var['W_%d' % self.count] = W
     self.var['b_%d' % self.count] = b
 
   '''
     Calculate NN value.
   '''
-  def nn(self, x):
+  def model(self, x):
+    self.count = 0
+    self.add_prior(10)
+    self.add_prior(1)
     for i in range(1, self.count+1):
       W = self.var['W_%d' % i]
       b = self.var['b_%d' % i]
@@ -75,10 +88,8 @@ class BNN(object):
         x = tf.nn.leaky_relu(x, alpha = 0.2, name = 'act_%d' % i)
       else:
         x = tf.nn.sigmoid(x, name = 'act_%d' % i)
+    x  = ed.Normal(loc = x, scale = 1.0, name = 'out')
     return x
-
-  def model(self, x):
-    return ed.Normal(loc = self.nn(x), scale = tf.constant(1.0, dtype = tf.float32), name = 'out')
 
   def target_log_prob_fn(self, *param):
     kwargs = {}
@@ -86,7 +97,7 @@ class BNN(object):
     for i in sorted(self.var.keys()):
       kwargs[i] = param[c]
       c += 1
-    log_prob = 0
+    log_prob = tf.zeros([])
     for x,w,y in self.get_batch():
         log_prob += self.log_joint(x, out = y[:,np.newaxis], **kwargs)
     return log_prob
@@ -98,15 +109,11 @@ class BNN(object):
     if not self.session:
       self.session = tf.Session()
     with self.session.as_default():
-      with tf.variable_scope('model'):
-        if not self.input:
-          self.input = tf.placeholder(tf.float32, shape = (None, self.n_dimensions), name = 'input')
-        if len(self.var) == 0:
-          self.count = 0
-          self.add_prior(10)
-          self.add_prior(1)
-        self.log_joint = ed.make_log_joint_fn(self.model)
-      #with tf.variable_scope('posterior'):
+      if not self.input:
+        self.input = tf.placeholder(tf.float32, shape = (None, self.n_dimensions), name = 'input')
+      self.nnout = self.model(self.input)
+      self.session.run(tf.global_variables_initializer())
+      self.log_joint = ed.make_log_joint_fn(self.model)
       #  # for variational inference
       #  if self.variational_inference:
       #    for i in self.var:
@@ -121,7 +128,6 @@ class BNN(object):
       #      with tf.variable_scope(name):
       #        shape = [N] + self.var[i].shape[:]
       #        self.posterior[name] = ed.models.Empirical(params = tf.zeros(shape))
-      self.session.run(tf.global_variables_initializer())
 
   '''
     Read input from file.
@@ -144,11 +150,11 @@ class BNN(object):
     x = {}
     for t in ['train', 'test']:
       all_data = np.zeros(shape = (0, 2+2))
-      signal = np.random.normal(loc = -1.0, scale = 0.5, size = (N, 2)).astype(np.float32)
-      bkg    = np.random.normal(loc =  1.0, scale = 0.5, size = (N, 2)).astype(np.float32)
+      signal = np.random.normal(loc = -1.0, scale = 0.5, size = (N, 2))
+      bkg    = np.random.normal(loc =  1.0, scale = 0.5, size = (N, 2))
       data   = np.append(signal, bkg, axis = 0)
-      data_t = np.append(np.ones(N, dtype = np.float32), np.zeros(N, dtype = np.float32))
-      data_w = np.append(np.ones(N, dtype = np.float32), np.ones(N, dtype = np.float32))
+      data_t = np.append(np.ones(N), np.zeros(N))
+      data_w = np.append(np.ones(N), np.ones(N))
       add_all_data = np.concatenate( (data_t[:,np.newaxis], data_w[:,np.newaxis], data), axis=1)
       all_data = np.concatenate((all_data, add_all_data), axis = 0)
       print('Checking nans in %s' % t)
@@ -207,7 +213,7 @@ class BNN(object):
     out_signal = {}
     out_bkg = {}
     N = 5
-    nnout = self.nn(self.input)
+    nnout = self.nnout
     for i in range(N):
       out_signal[i] = []
       out_bkg[i] = []
@@ -263,9 +269,9 @@ class BNN(object):
 
     r = rows[0 : self.n_batch]
     r = sorted(r)
-    x_batch = self.file['train'][r, self.col_data:]
-    x_batch_w = self.file['train'][r, self.col_weight]
-    y_batch = self.file['train'][r, self.col_signal]
+    x_batch = self.file['train'][r, self.col_data:].astype(np.float32)
+    x_batch_w = self.file['train'][r, self.col_weight].astype(np.float32)
+    y_batch = self.file['train'][r, self.col_signal].astype(np.float32)
     return x_batch, x_batch_w, y_batch
 
   def train(self, prefix, result_dir, network_dir):
@@ -273,19 +279,25 @@ class BNN(object):
 
     first_state = []
     for i in sorted(self.var.keys()):
-      first_state.append(tf.random.normal(mean = 0.0, stddev = 1.0, shape = self.var[i].shape, dtype = tf.float32))
+      first_state.append(tf.random_normal(shape = self.var[i].shape, name = "f_%s" % i))
 
-    hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+
+    with self.session.as_default():
+      hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
                           target_log_prob_fn = self.target_log_prob_fn,
-                          step_size          = 0.01,
-                          num_leapfrog_steps = 100)
-    states, kernel_results = tfp.mcmc.sample_chain(
+                          step_size          = 0.1,
+                          num_leapfrog_steps = 5)
+
+      graph = tf.get_default_graph()
+      dot = tf_to_dot(graph)
+      dot.render('graph.gv', view=False) 
+
+      states, kernel_results = tfp.mcmc.sample_chain(
                           num_results        = self.n_posterior,
                           current_state      = first_state,
                           kernel             = hmc_kernel,
                           num_burnin_steps   = 500)
 
-    with self.session.as_default():
       self.posterior, results_out = self.session.run([states, kernel_results])
 
     print(self.posterior)
@@ -296,7 +308,7 @@ class BNN(object):
     print("============ End of training ===============")
 
   def save(self, discriminator_filename):
-    outputs = {'output': self.nn(self.input)}
+    outputs = {'output': self.model(self.input)}
     for i in self.var:
       outputs[i] = self.var
     tf.save_model.simple_save(self.session,
@@ -314,6 +326,7 @@ class BNN(object):
       with tf.variable_scope('model'):
         graph = tf.get_default_graph()
         self.input = graph.get_tensor_by_name("input:0")
+        self.nnout = graph.get_tensor_by_name("out:0")
         allVars = [op.name for op in graph.get_operations() if op.op_def and (op.op_def.name == 'Variable' or op.op_def.name == 'VariableV2')]
         allVars = sorted(allVars)
         self.count = 0
