@@ -85,6 +85,9 @@ class BNN(object):
   '''
   def model(self, x):
     self.count = 0
+    self.add_prior(200)
+    self.add_prior(100)
+    self.add_prior(50)
     self.add_prior(10)
     self.add_prior(1)
     for i in range(1, self.count+1):
@@ -216,13 +219,14 @@ class BNN(object):
     plt.savefig(filename)
     plt.close("all")
 
-  def plot_discriminator_output(self, filename):
+  def plot_discriminator_output(self, filename, nnout = None):
     import matplotlib.pyplot as plt
     import seaborn as sns
     out_signal = {}
     out_bkg = {}
+    if nnout == None:
+      nnout = self.nnout
     N = 5
-    nnout = self.nnout
     for i in range(N):
       out_signal[i] = []
       out_bkg[i] = []
@@ -354,7 +358,7 @@ class BNN(object):
       self.posterior[k] = f[k][:]
     f.close()
 
-    for i in sorted(self.var.keys()):
+    for i in sorted(self.posterior):
       self.posterior_mean[i] = np.mean(self.posterior[i], axis = 0)
       self.posterior_std[i] = np.std(self.posterior[i], axis = 0)
 
@@ -424,7 +428,7 @@ def main():
     # this will just be random!
     # try to predict if the signal or bkg. events in the test set are really signal or bkg.
     print("Plotting discriminator output.")
-    network.plot_discriminator_output("%s/%s_discriminator_output_before_training.pdf" % (args.result_dir, prefix))
+    network.plot_discriminator_output("%s/%s_discriminator_output_before_training.pdf" % (args.result_dir, prefix), nnout = network.posterior_predictive)
 
     # train it
     print("Training.")
@@ -433,8 +437,8 @@ def main():
     print("Plotting discriminator output after training.")
     network.plot_discriminator_output("%s/%s_discriminator_output.pdf" % (args.result_dir, prefix))
   elif args.mode == 'plot_disc':
-    network.load("%s/%s_discriminator_%s" % (args.network_dir, prefix, trained))
-    network.plot_discriminator_output("%s/%s_discriminator_output.pdf" % (args.result_dir, prefix))
+    network.load("%s/%s_discriminator" % (args.network_dir, prefix))
+    network.plot_discriminator_output("%s/%s_discriminator_output.pdf" % (args.result_dir, prefix), nnout = network.posterior_predictive)
   elif args.mode == 'plot_input':
     network.plot_input_correlations("%s/%s_corr.pdf" % (args.result_dir, prefix))
     network.plot_scatter_input(0, 1, "%s/%s_scatter_%d_%d.png" % (args.result_dir, prefix, 0, 1))
