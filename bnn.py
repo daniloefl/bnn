@@ -78,7 +78,7 @@ class BNN(object):
     return x
 
   def model(self, x):
-    return ed.Normal(loc = self.nn(x), scale = tf.constant(1), name = 'out')
+    return ed.Normal(loc = self.nn(x), scale = tf.constant(1.0, dtype = tf.float32), name = 'out')
 
   def target_log_prob_fn(self, *param):
     kwargs = {}
@@ -88,7 +88,7 @@ class BNN(object):
       c += 1
     log_prob = 0
     for x,w,y in self.get_batch():
-      log_prob += self.log_joint(x, out = y, **kwargs)
+        log_prob += self.log_joint(x, out = y[:,np.newaxis], **kwargs)
     return log_prob
 
   '''
@@ -252,9 +252,9 @@ class BNN(object):
     for i in range(0, int(N/self.n_batch)):
       r = rows[i*self.n_batch : (i+1)*self.n_batch]
       r = sorted(r)
-      x_batch = self.file[origin][r, self.col_data:]
-      x_batch_w = self.file[origin][r, self.col_weight]
-      y_batch = self.file[origin][r, self.col_signal]
+      x_batch = self.file[origin][r, self.col_data:].astype(np.float32)
+      x_batch_w = self.file[origin][r, self.col_weight].astype(np.float32)
+      y_batch = self.file[origin][r, self.col_signal].astype(np.float32)
       yield x_batch, x_batch_w, y_batch
 
   def get_batch_train(self):
