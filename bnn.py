@@ -60,6 +60,7 @@ class BNN(object):
 
     self.var = {} # variables
     self.session = None
+    self.graph = None
 
     self.input = None
     self.nnout = None
@@ -114,14 +115,14 @@ class BNN(object):
     Create network.
   '''
   def create_model(self):
-    if not self.session:
-      self.session = tf.Session()
+    self.session = tf.Session()
     with self.session.as_default():
       if not self.input:
         self.input = tf.placeholder(tf.float32, shape = (None, self.n_dimensions), name = 'input')
       self.nnout = self.model(self.input)
-      self.session.run(tf.global_variables_initializer())
       self.log_joint = ed.make_log_joint_fn(self.model)
+      self.session.run(tf.global_variables_initializer())
+      self.graph = tf.get_default_graph()
       #  # for variational inference
       #  if self.variational_inference:
       #    for i in self.var:
@@ -289,29 +290,29 @@ class BNN(object):
     for i in sorted(self.var.keys()):
       first_state.append(tf.random_normal(shape = self.var[i].shape, name = "f_%s" % i))
 
+    hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+                        target_log_prob_fn = self.target_log_prob_fn,
+                        step_size          = 0.1,
+                        num_leapfrog_steps = 5)
 
-    with self.session.as_default():
-      hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
-                          target_log_prob_fn = self.target_log_prob_fn,
-                          step_size          = 0.1,
-                          num_leapfrog_steps = 5)
+    dot = tf_to_dot(self.graph)
+    dot.render('%s/graph.gv' % result_dir, view=False) 
 
-      graph = tf.get_default_graph()
-      dot = tf_to_dot(graph)
-      dot.render('%s/graph.gv' % result_dir, view=False) 
+    states, kernel_results = tfp.mcmc.sample_chain(
+                        num_results        = self.n_posterior,
+                        current_state      = first_state,
+                        kernel             = hmc_kernel,
+                        num_burnin_steps   = 500)
 
-      states, kernel_results = tfp.mcmc.sample_chain(
-                          num_results        = self.n_posterior,
-                          current_state      = first_state,
-                          kernel             = hmc_kernel,
-                          num_burnin_steps   = 500)
+    posterior, results_out = self.session.run([states, kernel_results])
+    print('Sampling efficiency: {:.4f}'.format(results_out.is_accepted.mean()))
 
-      self.posterior, results_out = self.session.run([states, kernel_results])
-
+    self.posterior = {}
     c = 0
     for i in sorted(self.var.keys()):
-      self.posterior_mean[i] = np.mean(self.posterior[c], axis = 0)
-      self.posterior_std[i] = np.std(self.posterior[c], axis = 0)
+      self.posterior[i] = posterior[c]
+      self.posterior_mean[i] = np.mean(self.posterior[i], axis = 0)
+      self.posterior_std[i] = np.std(self.posterior[i], axis = 0)
       c += 1
 
     def make_value_setter(**model_kwargs):
@@ -336,50 +337,26 @@ class BNN(object):
     print("============ End of training ===============")
 
   def save(self, discriminator_filename):
-    outputs = {'output': self.model(self.input)}
-    for i in self.var:
-      outputs[i] = self.var
-    tf.save_model.simple_save(self.session,
-                              discriminator_filename,
-                              inputs = {'input': self.input},
-                              outputs = outputs)
     f = h5py.File(discriminator_filename + '_posterior_samples.h5', 'w')
-    f['posterior'] = self.posterior
+    for k in self.posterior:
+      f.create_dataset(k, data = self.posterior[k])
     f.close()
 
   '''
   Load stored network
   '''
   def load(self, discriminator_filename):
-    self.session = tf.Session()
-    with self.session.as_default():
-      tf.saved_model.loader.load(self.session, [tf.saved_model.tag_constants.SERVING], discriminator_filename)
-      graph = tf.get_default_graph()
-      self.input = graph.get_tensor_by_name("input:0")
-      self.nnout = graph.get_tensor_by_name("out:0")
-      allVars = [op.name for op in graph.get_operations() if op.op_def and (op.op_def.name == 'Variable' or op.op_def.name == 'VariableV2')]
-      allVars = sorted(allVars)
-      self.count = 0
-      for i in allVars:
-        if ("W_" in i[:3] or "b_" in i[:3]) and "/loc" in i:
-          name = i[:-4]
-          self.var[name] = ed.Normal(loc = graph.get_tensor_by_name(name + '/loc:0'),
-                                     scale = graph.get_tensor_by_name(name + '/scale:0'),
-                                     name = name)
-          n = int(name[3:])
-          if n > self.count:
-            self.count = n
-
     self.create_model()
 
     f = h5py.File(discriminator_filename + '_posterior_samples.h5')
-    self.posterior = f['posterior'][:]
+    self.posterior = {}
+    for k in list(f):
+      self.posterior[k] = f[k][:]
     f.close()
-    c = 0
+
     for i in sorted(self.var.keys()):
-      self.posterior_mean[i] = np.mean(self.posterior[c], axis = 0)
-      self.posterior_std[i] = np.std(self.posterior[c], axis = 0)
-      c += 1
+      self.posterior_mean[i] = np.mean(self.posterior[i], axis = 0)
+      self.posterior_std[i] = np.std(self.posterior[i], axis = 0)
 
     def make_value_setter(**model_kwargs):
       """Creates a value-setting interceptor."""
@@ -396,7 +373,7 @@ class BNN(object):
       for i in sorted(self.var.keys()):
         setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], name = "q_%s" % i)
       with ed.interception(make_value_setter(**setdir)):
-        self.posterior_predictive = self.nnout
+        self.posterior_predictive = self.model(self.input)
 
 def main():
   import argparse
@@ -452,10 +429,6 @@ def main():
     # train it
     print("Training.")
     network.train(prefix, args.result_dir, args.network_dir)
-
-    # plot training evolution
-    print("Plotting train metrics.")
-    network.plot_train_metrics("%s/%s_training.pdf" % (args.result_dir, prefix))
 
     print("Plotting discriminator output after training.")
     network.plot_discriminator_output("%s/%s_discriminator_output.pdf" % (args.result_dir, prefix))
