@@ -55,13 +55,19 @@ class BNN(object):
     self.n_batch = n_batch
     self.n_eval = n_eval
     self.n_posterior = n_posterior
+
     self.variational_inference = variational_inference
+
     self.var = {} # variables
     self.session = None
 
     self.input = None
+    self.nnout = None
 
-    self.posterior = {} # posterior
+    self.posterior = {} # posterior samples
+    self.posterior_mean = {} # posterior mean
+    self.posterior_std = {} # posterior std
+    self.posterior_predictive = None
 
   def add_prior(self, dim):
     self.count += 1
@@ -97,7 +103,7 @@ class BNN(object):
     for i in sorted(self.var.keys()):
       kwargs[i] = param[c]
       c += 1
-    log_prob = tf.zeros([])
+    log_prob = 0
     for x,w,y in self.get_batch():
         log_prob += self.log_joint(x, out = y[:,np.newaxis], **kwargs)
     return log_prob
@@ -301,7 +307,31 @@ class BNN(object):
       self.posterior, results_out = self.session.run([states, kernel_results])
 
     print(self.posterior)
+
+    c = 0
+    for i in sorted(self.var.keys()):
+      self.posterior_mean[i] = np.mean(self.posterior[c], axis = 0)
+      self.posterior_std[i] = np.std(self.posterior[c], axis = 0)
+      c += 1
+
     print(results_out)
+
+    def make_value_setter(**model_kwargs):
+      """Creates a value-setting interceptor."""
+      def set_values(f, *args, **kwargs):
+        """Sets random variable values to its aligned value."""
+        name = kwargs.get("name")
+        if name in model_kwargs:
+          kwargs["value"] = model_kwargs[name]
+        return ed.interceptable(f)(*args, **kwargs)
+      return set_values
+
+    with ed.tape() as model_tape:
+      setdir = {}
+      for i in sorted(self.var.keys()):
+        setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], shape = self.var[i].shape, name = "q_%s" % i)
+      with ed.interception(make_value_setter(setdir)):
+        self.posterior_predictive = self.model(self.input)
 
     self.save("%s/%s_discriminator" % (network_dir, prefix))
     #gc.collect()
@@ -315,6 +345,9 @@ class BNN(object):
                               discriminator_filename,
                               inputs = {'input': self.input},
                               outputs = outputs)
+    f = h5py.File(discriminator_filename + '_posterior_samples.h5', 'w')
+    f['posterior'] = self.posterior
+    f.close()
 
   '''
   Load stored network
@@ -323,24 +356,49 @@ class BNN(object):
     self.session = tf.Session()
     with self.session.as_default():
       tf.saved_model.loader.load(self.session, [tf.saved_model.tag_constants.SERVING], discriminator_filename)
-      with tf.variable_scope('model'):
-        graph = tf.get_default_graph()
-        self.input = graph.get_tensor_by_name("input:0")
-        self.nnout = graph.get_tensor_by_name("out:0")
-        allVars = [op.name for op in graph.get_operations() if op.op_def and (op.op_def.name == 'Variable' or op.op_def.name == 'VariableV2')]
-        allVars = sorted(allVars)
-        self.count = 0
-        for i in allVars:
-          if ("qW_" in i[:3] or "qb_" in i[:3]) and "/loc" in i:
-            name = i[:-4]
-            self.var[name] = ed.Normal(loc = graph.get_tensor_by_name(name + '/loc:0'),
-                                       scale = graph.get_tensor_by_name(name + '/scale:0'),
-                                       name = name)
-            n = int(name[3:])
-            if n > self.count:
-              self.count = n
+      graph = tf.get_default_graph()
+      self.input = graph.get_tensor_by_name("input:0")
+      self.nnout = graph.get_tensor_by_name("out:0")
+      allVars = [op.name for op in graph.get_operations() if op.op_def and (op.op_def.name == 'Variable' or op.op_def.name == 'VariableV2')]
+      allVars = sorted(allVars)
+      self.count = 0
+      for i in allVars:
+        if ("W_" in i[:3] or "b_" in i[:3]) and "/loc" in i:
+          name = i[:-4]
+          self.var[name] = ed.Normal(loc = graph.get_tensor_by_name(name + '/loc:0'),
+                                     scale = graph.get_tensor_by_name(name + '/scale:0'),
+                                     name = name)
+          n = int(name[3:])
+          if n > self.count:
+            self.count = n
 
     self.create_model()
+
+    f = h5py.File(discriminator_filename + '_posterior_samples.h5')
+    self.posterior = f['posterior'][:]
+    f.close()
+    c = 0
+    for i in sorted(self.var.keys()):
+      self.posterior_mean[i] = np.mean(self.posterior[c], axis = 0)
+      self.posterior_std[i] = np.std(self.posterior[c], axis = 0)
+      c += 1
+
+    def make_value_setter(**model_kwargs):
+      """Creates a value-setting interceptor."""
+      def set_values(f, *args, **kwargs):
+        """Sets random variable values to its aligned value."""
+        name = kwargs.get("name")
+        if name in model_kwargs:
+          kwargs["value"] = model_kwargs[name]
+        return ed.interceptable(f)(*args, **kwargs)
+      return set_values
+
+    with ed.tape() as model_tape:
+      setdir = {}
+      for i in sorted(self.var.keys()):
+        setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], shape = self.var[i].shape, name = "q_%s" % i)
+      with ed.interception(make_value_setter(setdir)):
+        self.posterior_predictive = self.model(self.input)
 
 def main():
   import argparse
