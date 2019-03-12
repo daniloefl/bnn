@@ -55,64 +55,124 @@ class BNN(object):
     self.n_batch = n_batch
     self.n_eval = n_eval
     self.n_posterior = n_posterior
+    self.n_posterior_run = 5
 
     self.variational_inference = variational_inference
 
-    self.var = {} # variables
     self.session = None
     self.graph = None
 
     self.input = None
-    self.nnout = None
+    self.output = None
 
     self.posterior = {} # posterior samples
     self.posterior_mean = {} # posterior mean
     self.posterior_std = {} # posterior std
-    self.posterior_predictive = None
-
-  def add_prior(self, dim):
-    self.count += 1
-    dim_prev = self.n_dimensions
-    if self.count > 1:
-      dim_prev = self.var['b_%d' % (self.count-1)].shape[-1]
-    W = ed.Normal(loc = 0.0, scale = 1.0, sample_shape = (dim_prev, dim), name = "W_%d" % self.count)
-    b = ed.Normal(loc = 0.0, scale = 1.0, sample_shape = (dim), name = "b_%d" % self.count)
-    self.var['W_%d' % self.count] = W
-    self.var['b_%d' % self.count] = b
 
   '''
-    Calculate NN value.
+    Model log. prob. (input x, output y, prior parameters for W and b, W, b)
   '''
-  def model(self, x):
-    self.count = 0
-    self.add_prior(200)
-    self.add_prior(100)
-    self.add_prior(50)
-    self.add_prior(10)
-    self.add_prior(1)
-    for i in range(1, self.count+1):
-      W = self.var['W_%d' % i]
-      b = self.var['b_%d' % i]
-      x = tf.matmul(x, W, name = 'prod_%d' % i) + b
-      if i < self.count:
-        x = tf.nn.leaky_relu(x, alpha = 0.2, name = 'act_%d' % i)
+  def model_logprob(self, x, y, p_Wmu, p_Wstd, p_bmu, p_bstd, **param):
+    logprob = tf.zeros([])
+    rv_W = []
+    rv_b = []
+    for i in range(0, len(self.layers)-1):
+      rv_W.append(tfp.distributions.Normal(loc = p_Wmu[i], scale = p_Wstd[i]))
+      rv_b.append(tfp.distributions.Normal(loc = p_bmu[i], scale = p_bstd[i]))
+
+      logprob += tf.reduce_sum(rv_W[i].log_prob(param["W_%d" % i]))
+      logprob += tf.reduce_sum(rv_b[i].log_prob(param["b_%d" % i]))
+
+      x = tf.matmul(x, param["W_%d" % i]) + param["b_%d" %i]
+      if i < len(self.layers)-2:
+        x = tf.nn.leaky_relu(x, alpha = 0.2)
       else:
-        x = tf.nn.sigmoid(x, name = 'act_%d' % i)
-    x  = ed.Normal(loc = x, scale = 1.0, name = 'out')
-    return x
+        x = tf.nn.sigmoid(x)
+    rv_observation = tfp.distributions.Normal(loc = x, scale = 1.0)
+    logprob += tf.reduce_sum(rv_observation.log_prob(y), axis = [0, 1])
+    return logprob
 
-  def target_log_prob_fn(self, *param):
+  '''
+    Return log. prob. in model_logprob feeding it the data.
+    The only parameters in param are the W and b being sampled.
+    Models the log. posterior log p(w,b|x,y).
+  '''
+  def weight_inference_logprob(self, *param):
     kwargs = {}
     c = 0
-    for i in sorted(self.var.keys()):
-      kwargs[i] = param[c]
+    for i in range(0, len(self.layers)-1):
+      kwargs["W_%s" % i] = param[c]
       c += 1
-    x,w,y = self.get_full_train()
-    return self.log_joint(x, out = y[:,np.newaxis], **kwargs)
-    #log_prob = 0
-    #for x,w,y in self.get_batch():
-    #    log_prob += self.log_joint(x, out = y[:,np.newaxis], **kwargs)
-    return log_prob
+      kwargs["b_%s" % i] = param[c]
+      c += 1
+    p_Wmu = [tf.zeros([self.layers[i], self.layers[i+1]]) for i in range(0, len(self.layers)-1)]
+    p_Wstd = [tf.ones([self.layers[i], self.layers[i+1]]) for i in range(0, len(self.layers)-1)]
+    p_bmu = [tf.zeros([self.layers[i+1]]) for i in range(0, len(self.layers)-1)]
+    p_bstd = [tf.ones([self.layers[i+1]]) for i in range(0, len(self.layers)-1)]
+    return self.model_logprob(x = self.input, y = self.output, p_Wmu = p_Wmu, p_Wstd = p_Wstd, p_bmu = p_bmu, p_bstd = p_bstd, **kwargs)
+
+  '''
+    Return log. prob. in model_logprob fixing the posterior W and b and inputting new data.
+    The parameters in param are y, W and b being sampled
+    Models log p(y|w,b,x) p(w) p(b).
+  '''
+  def run_logprob(self, *param):
+    kwargs = {}
+    c = 0
+    kwargs["y"] = param[c]
+    c += 1
+    for i in range(0, len(self.layers)-1):
+      kwargs["W_%s" % i] = param[c]
+      c += 1
+      kwargs["b_%s" % i] = param[c]
+      c += 1
+    p_Wmu =  [tf.convert_to_tensor(self.posterior_mean["W_%d" % (i)], dtype = tf.float32) for i in range(0, len(self.layers)-1)]
+    p_Wstd = [tf.convert_to_tensor(self.posterior_std["W_%d" % (i)], dtype = tf.float32) for i in range(0, len(self.layers)-1)]
+    p_bmu =  [tf.convert_to_tensor(self.posterior_mean["b_%d" % (i)], dtype = tf.float32) for i in range(0, len(self.layers)-1)]
+    p_bstd = [tf.convert_to_tensor(self.posterior_std["b_%d" % (i)], dtype = tf.float32) for i in range(0, len(self.layers)-1)]
+    return self.model_logprob(x = self.input, p_Wmu = p_Wmu, p_Wstd = p_Wstd, p_bmu = p_bmu, p_bstd = p_bstd, **kwargs)
+
+  def sample(self, logprob, first_state, n_posterior):
+    hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
+                        target_log_prob_fn = logprob,
+                        step_size          = 0.01,
+                        num_leapfrog_steps = 10)
+
+    states, kernel_results = tfp.mcmc.sample_chain(
+                        num_results        = n_posterior,
+                        current_state      = first_state,
+                        kernel             = hmc_kernel,
+                        num_burnin_steps   = 500)
+
+    return states
+
+  def set_sample_run(self, n_posterior):
+    first_state = []
+    first_state.append(tf.random_normal(shape = (1,), dtype = tf.float32))
+    for i in range(0, len(self.layers)-1):
+      first_state.append(tf.random_normal(shape = self.posterior_mean["W_%d" % i].shape, dtype = tf.float32))
+      first_state.append(tf.random_normal(shape = self.posterior_mean["b_%d" % i].shape, dtype = tf.float32))
+    self.sample_run = self.sample(self.run_logprob, first_state, n_posterior)
+
+  def set_sample_infer(self, n_posterior):
+    first_state = []
+    for i in range(0, len(self.layers)-1):
+      first_state.append(tf.random_normal(shape = self.posterior_mean["W_%d" % i].shape, dtype = tf.float32))
+      first_state.append(tf.random_normal(shape = self.posterior_mean["b_%d" % i].shape, dtype = tf.float32))
+    self.sample_infer = self.sample(self.weight_inference_logprob, first_state, n_posterior)
+
+  def run(self, x):
+    posterior = self.session.run(self.sample_run, {self.input: x})
+    return posterior[0].astype(np.float32)
+
+  def infer(self, x, y):
+    posterior = self.session.run(self.sample_infer, {self.input: x, self.output: y})
+    c = 0
+    for i in range(0, len(self.layers)-1):
+      self.posterior["W_%d" % i] = posterior[c].astype(np.float32)
+      c += 1
+      self.posterior["b_%d" % i] = posterior[c].astype(np.float32)
+      c += 1
 
   '''
     Create network.
@@ -120,26 +180,25 @@ class BNN(object):
   def create_model(self):
     self.session = tf.Session()
     with self.session.as_default():
+      self.layers = [self.n_dimensions, 10, 5, 1]
+      if len(self.posterior_mean) == 0:
+        for i in range(0, len(self.layers)-1):
+          self.posterior_mean["W_%d" % i] = np.zeros( [self.layers[i], self.layers[i+1]], dtype = np.float32 )
+          self.posterior_mean["b_%d" % i] = np.zeros( [self.layers[i+1]], dtype = np.float32 )
+          self.posterior_std["W_%d" % i] = np.ones( [self.layers[i], self.layers[i+1]], dtype = np.float32 )
+          self.posterior_std["b_%d" % i] = np.ones( [self.layers[i+1]], dtype = np.float32 )
+
       if not self.input:
         self.input = tf.placeholder(tf.float32, shape = (None, self.n_dimensions), name = 'input')
-      self.nnout = self.model(self.input)
-      self.log_joint = ed.make_log_joint_fn(self.model)
-      self.session.run(tf.global_variables_initializer())
-      self.graph = tf.get_default_graph()
-      #  # for variational inference
-      #  if self.variational_inference:
-      #    for i in self.var:
-      #      name = "q%s" % i
-      #      with tf.variable_scope(name):
-      #        loc = tf.get_variable("loc", shape = self.var[i].shape)
-      #        scale = tf.nn.softplus(tf.get_variable("scale", shape = self.var[i].shape))
-      #        self.posterior[name] = ed.models.Normal(loc = loc, scale = scale)
-      #  else:
-      #    for i in self.var:
-      #      name = "q%s" % i
-      #      with tf.variable_scope(name):
-      #        shape = [N] + self.var[i].shape[:]
-      #        self.posterior[name] = ed.models.Empirical(params = tf.zeros(shape))
+      if not self.output:
+        self.output = tf.placeholder(tf.float32, shape = (None), name = 'output')
+
+      self.init_op = tf.global_variables_initializer()
+
+      self.set_sample_infer(self.n_posterior)
+      self.set_sample_run(self.n_posterior_run)
+
+
 
   '''
     Read input from file.
@@ -219,36 +278,32 @@ class BNN(object):
     plt.savefig(filename)
     plt.close("all")
 
-  def plot_discriminator_output(self, filename, nnout = None):
+  def plot_discriminator_output(self, filename):
     import matplotlib.pyplot as plt
     import seaborn as sns
     out_signal = {}
     out_bkg = {}
-    if nnout == None:
-      nnout = self.nnout
-    N = 5
-    for i in range(N):
-      out_signal[i] = []
-      out_bkg[i] = []
-      for x,w,y in self.get_batch(origin = 'test', signal = True):
-        out_signal[i].extend(self.session.run(nnout, {self.input: x}))
-      out_signal[i] = np.array(out_signal[i])
-      for x,w,y in self.get_batch(origin = 'test', signal = False):
-        out_bkg[i].extend(self.session.run(nnout, {self.input: x}))
-      out_bkg[i] = np.array(out_bkg[i])
+    out_signal = np.zeros(shape = (self.n_posterior_run,0))
+    out_bkg = np.zeros(shape = (self.n_posterior_run,0))
+    for x,w,y in self.get_batch(origin = 'test', signal = True):
+      out_signal = np.append(out_signal, self.run(x), axis = 1)
+    for x,w,y in self.get_batch(origin = 'test', signal = False):
+      out_bkg = np.append(out_bkg, self.run(x), axis = 1)
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111)
-    bins = np.linspace(np.amin(out_signal[0]), np.amax(out_signal[0]), 10)
+    print(out_signal.shape)
+    bins = np.linspace(np.amin(out_signal[0,:]), np.amax(out_signal[0,:]), 10)
+    N = out_signal.shape[0]
     for i in range(N):
       label_s = None
       label_b = None
       if i == 0:
         label_s = "Test signal"
         label_b = "Test bkg."
-      sns.distplot(out_signal[i], bins = bins,
+      sns.distplot(out_signal[i,:], bins = bins,
                    kde = False, label = label_s, norm_hist = True, hist = True,
                    hist_kws={"histtype": "step", "linewidth": 2, "color": "r"})
-      sns.distplot(out_bkg[i], bins = bins,
+      sns.distplot(out_bkg[i,:], bins = bins,
                    kde = False, label = label_b, norm_hist = True, hist = True,
                    hist_kws={"histtype": "step", "linewidth": 2, "color": "b"})
     ax.set(xlabel = 'NN output', ylabel = 'Events', title = '');
@@ -294,53 +349,19 @@ class BNN(object):
     return x_batch, x_batch_w, y_batch
 
   def train(self, prefix, result_dir, network_dir):
-    N = len(self.file['train'])
+    self.session.run(self.init_op)
 
-    first_state = []
-    for i in sorted(self.var.keys()):
-      first_state.append(tf.random_normal(shape = self.var[i].shape, name = "f_%s" % i))
-
-    hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
-                        target_log_prob_fn = self.target_log_prob_fn,
-                        step_size          = 0.001,
-                        num_leapfrog_steps = 10)
+    self.graph = tf.get_default_graph()
 
     dot = tf_to_dot(self.graph)
     dot.render('%s/graph.gv' % result_dir, view=False) 
 
-    states, kernel_results = tfp.mcmc.sample_chain(
-                        num_results        = self.n_posterior,
-                        current_state      = first_state,
-                        kernel             = hmc_kernel,
-                        num_burnin_steps   = 500)
+    x,w,y = self.get_full_train()
+    self.infer(x, y)
 
-    posterior, results_out = self.session.run([states, kernel_results])
-    print('Sampling efficiency: {:.4f}'.format(results_out.is_accepted.mean()))
-
-    self.posterior = {}
-    c = 0
-    for i in sorted(self.var.keys()):
-      self.posterior[i] = posterior[c]
+    for i in self.posterior:
       self.posterior_mean[i] = np.mean(self.posterior[i], axis = 0)
       self.posterior_std[i] = np.std(self.posterior[i], axis = 0)
-      c += 1
-
-    def make_value_setter(**model_kwargs):
-      """Creates a value-setting interceptor."""
-      def set_values(f, *args, **kwargs):
-        """Sets random variable values to its aligned value."""
-        name = kwargs.get("name")
-        if name in model_kwargs:
-          kwargs["value"] = model_kwargs[name]
-        return ed.interceptable(f)(*args, **kwargs)
-      return set_values
-
-    with ed.tape() as model_tape:
-      setdir = {}
-      for i in sorted(self.var.keys()):
-        setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], name = "q_%s" % i)
-      with ed.interception(make_value_setter(**setdir)):
-        self.posterior_predictive = self.model(self.input)
 
     self.save("%s/%s_discriminator" % (network_dir, prefix))
     #gc.collect()
@@ -356,35 +377,18 @@ class BNN(object):
   Load stored network
   '''
   def load(self, discriminator_filename):
-    self.create_model()
-
     f = h5py.File(discriminator_filename + '_posterior_samples.h5')
     self.posterior = {}
     for k in list(f):
-      self.posterior[k] = f[k][:]
+      self.posterior[k] = f[k][:].astype(np.float32)
     f.close()
 
     for i in sorted(self.posterior):
       self.posterior_mean[i] = np.mean(self.posterior[i], axis = 0)
       self.posterior_std[i] = np.std(self.posterior[i], axis = 0)
 
+    self.create_model()
 
-    def make_value_setter(**model_kwargs):
-      """Creates a value-setting interceptor."""
-      def set_values(f, *args, **kwargs):
-        """Sets random variable values to its aligned value."""
-        name = kwargs.get("name")
-        if name in model_kwargs:
-          kwargs["value"] = model_kwargs[name]
-        return ed.interceptable(f)(*args, **kwargs)
-      return set_values
-
-    with ed.tape() as model_tape:
-      setdir = {}
-      for i in sorted(self.var.keys()):
-        setdir[i] = ed.Normal(loc = self.posterior_mean[i], scale = self.posterior_std[i], name = "q_%s" % i)
-      with ed.interception(make_value_setter(**setdir)):
-        self.posterior_predictive = self.model(self.input)
 
 def main():
   import argparse
@@ -435,7 +439,7 @@ def main():
     # this will just be random!
     # try to predict if the signal or bkg. events in the test set are really signal or bkg.
     print("Plotting discriminator output.")
-    network.plot_discriminator_output("%s/%s_discriminator_output_before_training.pdf" % (args.result_dir, prefix), nnout = network.posterior_predictive)
+    network.plot_discriminator_output("%s/%s_discriminator_output_before_training.pdf" % (args.result_dir, prefix))
 
     # train it
     print("Training.")
@@ -445,7 +449,7 @@ def main():
     network.plot_discriminator_output("%s/%s_discriminator_output.pdf" % (args.result_dir, prefix))
   elif args.mode == 'plot_disc':
     network.load("%s/%s_discriminator" % (args.network_dir, prefix))
-    network.plot_discriminator_output("%s/%s_discriminator_output.pdf" % (args.result_dir, prefix), nnout = network.posterior_predictive)
+    network.plot_discriminator_output("%s/%s_discriminator_output.pdf" % (args.result_dir, prefix))
   elif args.mode == 'plot_input':
     network.plot_input_correlations("%s/%s_corr.pdf" % (args.result_dir, prefix))
     network.plot_scatter_input(0, 1, "%s/%s_scatter_%d_%d.png" % (args.result_dir, prefix, 0, 1))
