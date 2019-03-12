@@ -41,7 +41,7 @@ class BNN(object):
   def __init__(self, n_iteration = 1050,
                n_batch = 32,
                n_eval = 50,
-               n_posterior = 10000,
+               n_posterior = 1000,
                variational_inference = False):
     '''
     Initialise the network.
@@ -89,8 +89,7 @@ class BNN(object):
       else:
         x = tf.nn.sigmoid(x)
     rv_observation = tfp.distributions.Normal(loc = x, scale = 1.0)
-    logprob += tf.reduce_sum(rv_observation.log_prob(y), axis = [0, 1])
-    return logprob
+    return logprob, rv_observation.log_prob(y)
 
   '''
     Return log. prob. in model_logprob feeding it the data.
@@ -109,7 +108,9 @@ class BNN(object):
     p_Wstd = [tf.ones([self.layers[i], self.layers[i+1]]) for i in range(0, len(self.layers)-1)]
     p_bmu = [tf.zeros([self.layers[i+1]]) for i in range(0, len(self.layers)-1)]
     p_bstd = [tf.ones([self.layers[i+1]]) for i in range(0, len(self.layers)-1)]
-    return self.model_logprob(x = self.input, y = self.output, p_Wmu = p_Wmu, p_Wstd = p_Wstd, p_bmu = p_bmu, p_bstd = p_bstd, **kwargs)
+    logprob, obs = self.model_logprob(x = self.input, y = self.output, p_Wmu = p_Wmu, p_Wstd = p_Wstd, p_bmu = p_bmu, p_bstd = p_bstd, **kwargs)
+    logprob += tf.reduce_sum(obs, axis = [0, 1])
+    return logprob
 
   '''
     Return log. prob. in model_logprob fixing the posterior W and b and inputting new data.
@@ -130,9 +131,11 @@ class BNN(object):
     p_Wstd = [tf.convert_to_tensor(self.posterior_std["W_%d" % (i)], dtype = tf.float32) for i in range(0, len(self.layers)-1)]
     p_bmu =  [tf.convert_to_tensor(self.posterior_mean["b_%d" % (i)], dtype = tf.float32) for i in range(0, len(self.layers)-1)]
     p_bstd = [tf.convert_to_tensor(self.posterior_std["b_%d" % (i)], dtype = tf.float32) for i in range(0, len(self.layers)-1)]
-    return self.model_logprob(x = self.input, p_Wmu = p_Wmu, p_Wstd = p_Wstd, p_bmu = p_bmu, p_bstd = p_bstd, **kwargs)
+    logprob, obs = self.model_logprob(x = self.input, p_Wmu = p_Wmu, p_Wstd = p_Wstd, p_bmu = p_bmu, p_bstd = p_bstd, **kwargs)
+    logprob += tf.reduce_sum(obs, axis = [0, 1])
+    return logprob
 
-  def sample(self, logprob, first_state, n_posterior):
+  def sample(self, logprob, first_state, n_posterior, Nburnin = 500):
     hmc_kernel = tfp.mcmc.HamiltonianMonteCarlo(
                         target_log_prob_fn = logprob,
                         step_size          = 0.01,
@@ -142,7 +145,7 @@ class BNN(object):
                         num_results        = n_posterior,
                         current_state      = first_state,
                         kernel             = hmc_kernel,
-                        num_burnin_steps   = 500)
+                        num_burnin_steps   = Nburnin)
 
     return states
 
@@ -152,7 +155,7 @@ class BNN(object):
     for i in range(0, len(self.layers)-1):
       first_state.append(tf.random_normal(shape = self.posterior_mean["W_%d" % i].shape, dtype = tf.float32))
       first_state.append(tf.random_normal(shape = self.posterior_mean["b_%d" % i].shape, dtype = tf.float32))
-    self.sample_run = self.sample(self.run_logprob, first_state, n_posterior)
+    self.sample_run = self.sample(self.run_logprob, first_state, n_posterior, 1)
 
   def set_sample_infer(self, n_posterior):
     first_state = []
@@ -162,8 +165,11 @@ class BNN(object):
     self.sample_infer = self.sample(self.weight_inference_logprob, first_state, n_posterior)
 
   def run(self, x):
-    posterior = self.session.run(self.sample_run, {self.input: x})
-    return posterior[0].astype(np.float32)
+    ret = np.zeros([self.n_posterior_run, x.shape[0]])
+    for i in range(0, x.shape[0]):
+        posterior = self.session.run(self.sample_run, {self.input: x[i,np.newaxis,:]})
+        ret[:,i] = posterior[0][:,0].astype(np.float32)
+    return ret
 
   def infer(self, x, y):
     posterior = self.session.run(self.sample_infer, {self.input: x, self.output: y})
@@ -353,8 +359,8 @@ class BNN(object):
 
     self.graph = tf.get_default_graph()
 
-    dot = tf_to_dot(self.graph)
-    dot.render('%s/graph.gv' % result_dir, view=False) 
+    #dot = tf_to_dot(self.graph)
+    #dot.render('%s/graph.gv' % result_dir, view=False) 
 
     x,w,y = self.get_full_train()
     self.infer(x, y)
