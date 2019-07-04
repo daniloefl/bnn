@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 import numpy as np
+import scipy
 import pandas as pd
 
 import tensorflow as tf
@@ -34,16 +35,22 @@ class VIBNN(object):
             y = tf.placeholder(tf.float32, shape=(None, 1), name = 'y')
             with tf.variable_scope('model'):
                 nn = tf.keras.Sequential([
+                                        #tf.keras.layers.BatchNormalization(),
                                         tfp.layers.DenseFlipout(20, activation = tf.nn.relu),
                                         tfp.layers.DenseFlipout(10, activation = tf.nn.relu),
-                                        tfp.layers.DenseFlipout( 1, activation = tf.nn.sigmoid),
+                                        tfp.layers.DenseFlipout( 2, activation = None),
                                         ], name = 'nn')
                 logits = tf.identity(nn(x), name = 'logits')
-                pred_distribution = tfp.distributions.Normal(loc = logits, scale = 1.0)
-                self.logprob = tf.reduce_mean(pred_distribution.log_prob(y), name = 'logprob')
-                self.mse = tf.reduce_mean(tf.square(logits - y), name = 'mse')
-                self.kldiv = tf.identity(sum(nn.losses)/self.batch_size, name = 'kldiv')
-                self.elbo = tf.identity(self.logprob - self.kldiv, name = 'elbo')
+                pred_distribution = tfp.distributions.Categorical(logits = logits)
+                logprob = tf.reduce_mean(pred_distribution.log_prob(y[:,0]), name = 'logprob')
+                pred = tf.cast(tf.argmax(logits, axis = -1), tf.float32, name = 'prediction')
+                #pred_distribution = tfp.distributions.Normal(loc = logits[:,0], scale = 1.0) 
+                #logprob = tf.reduce_mean(pred_distribution.log_prob(y[:,0]), name = 'logprob')
+                #pred = tf.identity(logits[:,0], name = 'prediction')
+                mse = tf.reduce_mean(tf.square(y[:,0] - pred), name = 'mse')
+                acc = tf.reduce_mean(tf.cast(tf.equal(pred, y[:,0]), tf.float32), name = 'acc')
+                kldiv = tf.identity(sum(nn.losses)/self.N, name = 'kldiv')
+                elbo = tf.identity(logprob - kldiv, name = 'elbo')
                 qmu = {}
                 qstd = {}
                 for i, layer in enumerate(nn.layers):
@@ -53,10 +60,10 @@ class VIBNN(object):
                         continue
                     qmu[i] = q.mean()
                     qstd[i] = q.stddev()
-                self.opt = tf.train.AdamOptimizer(learning_rate = 0.01)
-                self.train_op = self.opt.minimize(-self.elbo, name = 'train_op')
-            self.init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer(), name = 'init_op')
-            self.session.run(self.init_op)
+                opt = tf.train.AdamOptimizer(learning_rate = 0.01)
+                train_op = opt.minimize(-elbo, name = 'train_op')
+            init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer(), name = 'init_op')
+            self.session.run(init_op)
             #g.finalize()
     def get_batch(self, **kwargs):
         filt = np.ones(self.N, dtype = 'bool')
@@ -79,39 +86,49 @@ class VIBNN(object):
         with self.graph.as_default() as g:
             x = g.get_tensor_by_name('x:0')
             y = g.get_tensor_by_name('y:0')
-            mse = g.get_tensor_by_name('model/mse:0')
+            pred = g.get_tensor_by_name('model/prediction:0')
             kldiv = g.get_tensor_by_name('model/kldiv:0')
             elbo = g.get_tensor_by_name('model/elbo:0')
-            #acc = g.get_tensor_by_name('model/acc:0')
+            mse = g.get_tensor_by_name('model/mse:0')
+            acc = g.get_tensor_by_name('model/acc:0')
+            logprob = g.get_tensor_by_name('model/logprob:0')
             train_op = g.get_operation_by_name('model/train_op')
+            batch_count = 0
             for i in range(0, self.Nepoch):
                 for x_batch, y_batch in self.get_batch():
                     _ = self.session.run(train_op,
                                          feed_dict = {x: x_batch,
                                                       y: y_batch})
-                if i % 1 == 0:
-                    elbo_, mse_, kldiv_, acc_ = 0.0, 0.0, 0.0, 0.0
-                    c = 0
-                    for x_batch, y_batch in self.get_batch():
-                        elbo_t, mse_t, kldiv_t = self.session.run([elbo, mse, kldiv], feed_dict = {x: x_batch, y: y_batch})
-                        elbo_ += elbo_t
-                        mse_ += mse_t
-                        kldiv_ += kldiv_t
-                        c += 1
-                    elbo_ /= c
-                    mse_ /= c
-                    kldiv_ /= c
-                    acc_ /= c
-                    print("Epoch {:3d}: -ELBO: {:>6.3f}, mse: {:>6.3f}, kldiv: {:>6.3f}, accuracy: {:>6.5f}".format(i, -elbo_, mse_, kldiv_, acc_))
-                    self.save('nn', i)
+                    batch_count += 1
+                    if batch_count % 10 == 0:
+                        elbo_, logprob_, kldiv_, acc_, mse_ = 0.0, 0.0, 0.0, 0.0, 0.0
+                        c = 0
+                        for x_batch, y_batch in self.get_batch():
+                            elbo_t, logprob_t, kldiv_t, acc_t, mse_t = self.session.run([elbo, logprob, kldiv, acc, mse], feed_dict = {x: x_batch, y: y_batch})
+                            elbo_ += elbo_t
+                            logprob_ += logprob_t
+                            kldiv_ += kldiv_t
+                            acc_ += acc_t
+                            mse_ += mse_t
+                            c += 1
+                        elbo_ /= c
+                        logprob_ /= c
+                        kldiv_ /= c
+                        acc_ /= c
+                        mse_ /= c
+                        print("Epoch {:2d}, batch cum. count {:2d}: -ELBO = -(logprob - kldiv): {:>6.3f}, logprob: {:>6.3f}, kldiv: {:>6.3f}, accuracy: {:>6.5f}, mse(out[0], y): {:>6.5f}".format(i, batch_count, -elbo_, logprob_, kldiv_, acc_, mse_))
+                        self.save('nn', batch_count)
     def run(self, x_batch, n_posterior_run = 10):
         with self.graph.as_default() as g:
             x = g.get_tensor_by_name('x:0')
             logits = g.get_tensor_by_name('model/logits:0')
-            logits_ = np.zeros((len(x_batch), n_posterior_run))
+            pred = g.get_tensor_by_name('model/prediction:0')
+            pred_ = np.zeros((len(x_batch), n_posterior_run))
+            logits_ = np.zeros((len(x_batch), 2, n_posterior_run))
             for i in range(0, n_posterior_run):
-                logits_[:, i] = self.session.run(logits, feed_dict = {x: x_batch})[:,0]
-            return logits_
+                pred_[:, i], logits_[:, :, i] = self.session.run([pred, logits], feed_dict = {x: x_batch})
+            prob_ = scipy.special.softmax(logits_, axis = 1)
+            return pred_, prob_
     def save(self, filename, step):
         with self.graph.as_default() as g:
             saver = tf.train.Saver()
@@ -126,8 +143,8 @@ class VIBNN(object):
         n_posterior_run = 10
         out_signal = np.zeros(shape = (0, n_posterior_run))
         out_bkg = np.zeros(shape = (0, n_posterior_run))
-        for x,y in self.get_batch(signal = True): out_signal = np.append(out_signal, self.run(x, n_posterior_run), axis = 0)
-        for x,y in self.get_batch(signal = False): out_bkg = np.append(out_bkg, self.run(x, n_posterior_run), axis = 0)
+        for x,y in self.get_batch(signal = True): out_signal = np.append(out_signal, self.run(x, n_posterior_run)[1][:,1,:], axis = 0)
+        for x,y in self.get_batch(signal = False): out_bkg = np.append(out_bkg, self.run(x, n_posterior_run)[1][:,1,:], axis = 0)
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111)
         bins = np.linspace(np.amin(out_signal[:,0]), np.amax(out_signal[:,0]), 10)
@@ -149,9 +166,6 @@ class VIBNN(object):
         plt.savefig('{}/{}'.format(self.result_dir, filename))
         plt.close("all")
     def plot_scatter_output(self, A, B, filename_mean, filename_std):
-        with self.graph.as_default() as g:
-            x = g.get_tensor_by_name('x:0')
-            logits = g.get_tensor_by_name('model/logits:0')
         n_posterior_run = 100
 
         df = self.file.select('df')
@@ -164,19 +178,16 @@ class VIBNN(object):
         inputs = np.vstack([bx.flatten(), by.flatten()]).T
         inputs = inputs.astype(np.float32)
 
-        logits_ = []
-        for i in range(0, n_posterior_run):
-          logits_.append(self.session.run(logits, feed_dict = {x: inputs})[:,0])
-        logits_ = np.vstack(logits_)
-        logits_mean = np.mean(logits_, axis = 0)
-        logits_std = np.std(logits_, axis = 0)
+        prob_ = self.run(inputs, n_posterior_run)[1][:,1,:]
+        prob_mean = np.mean(prob_, axis = 1)
+        prob_std = np.std(prob_, axis = 1)
 
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111)
 
         cmap = sns.diverging_palette(250, 12, s=85, l=25, as_cmap=True)
 
-        contour = ax.contourf(bx, by, logits_std.reshape((-1, bx.shape[1])), cmap=cmap)
+        contour = ax.contourf(bx, by, prob_std.reshape((-1, bx.shape[1])), cmap=cmap)
 
         ax.scatter(df[df['sig'] == 0][A], df[df['sig'] == 0][B], color = 'b', marker = 's', s = 5, label='Background')
         ax.scatter(df[df['sig'] == 1][A], df[df['sig'] == 1][B], color = 'r', marker = 's', s = 5, label='Signal')
@@ -196,7 +207,7 @@ class VIBNN(object):
 
         cmap = sns.diverging_palette(250, 12, s=85, l=25, as_cmap=True)
 
-        contour = ax.contourf(bx, by, logits_mean.reshape((-1, bx.shape[1])), cmap=cmap)
+        contour = ax.contourf(bx, by, prob_mean.reshape((-1, bx.shape[1])), cmap=cmap)
 
         ax.scatter(df[df['sig'] == 0][A], df[df['sig'] == 0][B], color = 'b', marker = 's', s = 5, label='Background')
         ax.scatter(df[df['sig'] == 1][A], df[df['sig'] == 1][B], color = 'r', marker = 's', s = 5, label='Signal')
@@ -225,8 +236,8 @@ def main():
                       default='data.h5',
                       help='Name of the file from where to read the input. If the file does not exist, create it. (default: "input.h5")')
     parser.add_argument('--load', dest = 'load', action = 'store',
-                       default = 49,
-                       help='Epoch to use when loading for testing.')
+                       default = 50,
+                       help='Batch count to use when loading for testing.')
     parser.add_argument('--train', dest = 'train', action = 'store_true',
                        default = False,
                        help='Train the network.')
