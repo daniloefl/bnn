@@ -131,12 +131,12 @@ class VIBNN_NF(object):
                  network_dir = 'network',
                  result_dir = 'result',
                  batch_size = 128,
-                 n_planar_flows = 8):
+                 n_planar_flows = 2):
         self.network_dir = network_dir
         self.result_dir = result_dir
         self.batch_size = batch_size
         self.n_planar_flows = n_planar_flows
-        self.Nepoch = 50
+        self.Nepoch = 2
     def load_data(self, filename):
         self.file = pd.HDFStore(filename, 'r')
         self.N = self.file['df'].shape[0]
@@ -351,7 +351,7 @@ def main():
                       default='data.h5',
                       help='Name of the file from where to read the input. If the file does not exist, create it. (default: "input.h5")')
     parser.add_argument('--load', dest = 'load', action = 'store',
-                       default = 50,
+                       default = 300,
                        help='Batch count to use when loading for testing.')
     parser.add_argument('--train', dest = 'train', action = 'store_true',
                        default = False,
