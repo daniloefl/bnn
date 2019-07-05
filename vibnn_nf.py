@@ -15,60 +15,127 @@ import pandas as pd
 import tensorflow as tf
 import tensorflow_probability as tfp
 
+class PF(object):
+    def __init__(self, name, add_variable_fn, shape, dtype):
+        self.name = name
+        self.add_variable_fn = add_variable_fn
+        self.shape = shape
+        self.dtype = dtype
+        self.pf_w = self.add_variable_fn("%s_w" % name, shape = shape, dtype = dtype, trainable = True)
+        self.pf_u = self.add_variable_fn("%s_u" % name, shape = shape, dtype = dtype, trainable = True)
+        self.pf_b = self.add_variable_fn("%s_b" % name, shape = [1],   dtype = dtype, trainable = True)
+    def forward(self, inputs):
+        z = inputs + self.pf_u*tf.sigmoid(tf.reduce_sum(tf.multiply(inputs, self.pf_w)) + self.pf_b)
+        return z
+    def logdetjac(self, inputs):
+        scalar = tf.reduce_sum(tf.multiply(inputs, self.pf_w)) + self.pf_b
+        psi = tf.sigmoid(scalar)*(1 - tf.sigmoid(scalar))*self.pf_w
+        ldj = tf.log(tf.abs(1 + tf.reduce_sum(tf.multiply(self.pf_u, psi))))
+        return ldj
+
+class GaussianParam(object):
+    def __init__(self, name, add_variable_fn, shape, dtype):
+        self.name = name
+        self.loc_initializer = tf.compat.v1.initializers.random_normal(stddev=0.1)
+        self.scale_initializer = tf.compat.v1.initializers.random_normal(mean=-3., stddev=0.1)
+        self.add_variable_fn = add_variable_fn
+        self.shape = shape
+        self.dtype = dtype
+        self.m = self.add_variable_fn("%s_m" % self.name, shape = self.shape, dtype = self.dtype, initializer = self.loc_initializer,     trainable = True)
+        self.s = self.add_variable_fn("%s_s" % self.name, shape = self.shape, dtype = self.dtype, initializer = self.scale_initializer,   trainable = True)
+        self.prior = tfp.distributions.Normal(loc = tf.zeros(self.shape), scale = tf.ones(self.shape))
+        self.posterior = tfp.distributions.Normal(loc = self.mean(), scale = self.stddev())
+    def mean(self):
+        return self.m
+    def stddev(self):
+        return (1e-6 + tf.math.softplus(self.s))
+    def sample(self):
+        return self.posterior.sample()
+
 class PlanarFlowDense(tf.keras.layers.Layer):
-    def __init__(self, units, activation, n_planar_flows, **kwargs):
-        super(PlanarFlowDense).__init__(kwargs)
-        self.units = units
+    def __init__(self, units, activation, n_planar_flows):
+        super(PlanarFlowDense, self).__init__()
+        self.units = int(units)
         self.activation = tf.keras.activations.get(activation)
-        self.n_planar_flows = n_planar_flows
+        self.n_planar_flows = int(n_planar_flows)
         self.built = False
+    def W_posterior(self):
+        # sample from weights
+        zW = self.W.sample()
+        # forward the weights through the norm. flow
+        for i in range(1, self.n_planar_flows+1):
+            zW = self.pf_W[i].forward(zW)
+        return zW
+    def b_posterior(self):
+        # sample from weights
+        zb = self.b.sample()
+        # forward the weights through the norm. flow
+        for i in range(1, self.n_planar_flows+1):
+            zb = self.pf_b[i].forward(zb)
+        return zb
     def build(self, input_shape):
         input_shape = tf.TensorShape(input_shape)
         dtype = tf.as_dtype(self.dtype or tf.keras.backend.floatx())
-        self.W_m = self.add_variable("W_m", shape = [int(input_shape[-1]), self.units], dtype = dtype)
-        self.b_m = self.add_variable("b_m", shape = [1, self.units], dtype = dtype)
-        self.W_s = self.add_variable("W_s", shape = [int(input_shape[-1]), self.units], dtype = dtype)
-        self.b_s = self.add_variable("b_s", shape = [1, self.units], dtype = dtype)
-        self.W_n = tfp.distributions.Normal(loc = tf.zeros(self.W_m.get_shape()), scale = tf.ones(self.W_m.get_shape()))
-        self.b_n = tfp.distributions.Normal(loc = tf.zeros(self.b_m.get_shape()), scale = tf.ones(self.b_m.get_shape()))
-        self.pf_w = {}
-        self.pf_u = {}
+
+        self.shape_W = [int(input_shape[-1]), self.units]
+        self.shape_b = [1, self.units]
+
+        # trainable parameters: mean and std. dev.
+        self.W = GaussianParam("W", add_variable_fn = self.add_variable, shape = self.shape_W, dtype = dtype)
+        self.b = GaussianParam("b", add_variable_fn = self.add_variable, shape = self.shape_b, dtype = dtype)
+
+        ## initialise PlanarFlow
+        self.pf_W = {}
         self.pf_b = {}
-        for i in range(1, self.n_planar_flows):
-            self.pf_w[i] = self.add_variable("pf_w_%d" % i, shape = [int(input_shape[-1]), self.units], dtype = dtype)
-            self.pf_u[i] = self.add_variable("pf_u_%d" % i, shape = [int(input_shape[-1]), self.units], dtype = dtype)
-            self.pf_b[i] = self.add_variable("pf_b_%d" % i, shape = [1], dtype = dtype)
+        for i in range(1, self.n_planar_flows+1):
+            self.pf_W[i] = PF("pfW%d" % i, self.add_variable, self.shape_W, dtype)
+            self.pf_b[i] = PF("pfb%d" % i, self.add_variable, self.shape_b, dtype)
+
         self.built = True
-    def call(self, inputs):
+    def call(self, inputs, training = False):
         inputs = tf.convert_to_tensor(value=inputs, dtype=self.dtype)
+
+        # generate weights from posterior
         zW = {}
         zb = {}
-        zW[0] = self.W_m + self.W_n.sample() * (1e-3 + tf.softplus(0.05 * self.W_s))
-        zb[0] = self.b_m + self.b_n.sample() * (1e-3 + tf.softplus(0.05 * self.b_s))
-        for i in range(1, self.n_planar_flows):
-            zW[i] = zW[i-1] + self.pf_u[i]*tf.sigmoid(tf.reduce_sum(zW[i-1]*self.pf_w[i]) + self.pf_b)
-            zb[i] = zb[i-1] + self.pf_u[i]*tf.sigmoid(tf.reduce_sum(zW[i-1]*self.pf_w[i]) + self.pf_b)
-        out = tf.matmul(inputs, zW[self.n_planar_flows-1]) + zb[self.n_planar_flows-1]
+        # sample from weights
+        zW[0] = self.W.sample()
+        zb[0] = self.b.sample()
+        # forward the weights through the norm. flow
+        for i in range(1, self.n_planar_flows+1):
+            zW[i] = self.pf_W[i].forward(zW[i-1])
+            zb[i] = self.pf_b[i].forward(zb[i-1])
+
+        # use weights to propagate input
+        out = tf.matmul(inputs, zW[self.n_planar_flows]) + zb[self.n_planar_flows]
         out = self.activation(out)
-        # add KL divergence between prior and posterior Gaussians
-        kl_div  = tfp.distributions.kl_divergence(tfp.distributions.Normal(loc = self.W_m, scale = (1e-3 + tf.softplus(0.05 * self.W_s))), self.W_n)
-        kl_div += tfp.distributions.kl_divergence(tfp.distributions.Normal(loc = self.b_m, scale = (1e-3 + tf.softplus(0.05 * self.b_s))), self.b_n)
+
+        # add KL divergence between prior and posterior Gaussians using weights before the flow
+        batch_ndims = tf.size(self.W.prior.batch_shape_tensor())
+        kl_div  = tfp.distributions.kl_divergence(tfp.distributions.Independent(self.W.posterior, reinterpreted_batch_ndims = batch_ndims),
+                                                  tfp.distributions.Independent(self.W.prior, reinterpreted_batch_ndims = batch_ndims))
+        kl_div += tfp.distributions.kl_divergence(tfp.distributions.Independent(self.b.posterior, reinterpreted_batch_ndims = batch_ndims),
+                                                  tfp.distributions.Independent(self.b.prior, reinterpreted_batch_ndims = batch_ndims))
         self.add_loss(kl_div, inputs = False)
-        # add sum of - log det Jacobian (-log |det df/dz|)
+        # include effect of the flow with the - log det Jacobian for each step of the flow
         ldj = 0
-        for i in range(self.n_planar_flows):
-            ldj += -tf.log(tf.abs(1.0 + self.pf_u[i]*))
-        self.add_loss(ldj, inputs = False)
-        return inputs
+        for i in range(1, self.n_planar_flows+1):
+            ldj += - self.pf_W[i].logdetjac(zW[i-1])
+            ldj += - self.pf_b[i].logdetjac(zb[i-1])
+        self.add_loss(ldj, inputs = True)
+
+        return out
 
 class VIBNN_NF(object):
     def __init__(self,
                  network_dir = 'network',
                  result_dir = 'result',
-                 batch_size = 128):
+                 batch_size = 128,
+                 n_planar_flows = 8):
         self.network_dir = network_dir
         self.result_dir = result_dir
         self.batch_size = batch_size
+        self.n_planar_flows = n_planar_flows
         self.Nepoch = 50
     def load_data(self, filename):
         self.file = pd.HDFStore(filename, 'r')
@@ -81,9 +148,9 @@ class VIBNN_NF(object):
             y = tf.placeholder(tf.float32, shape=(None, 1), name = 'y')
             with tf.variable_scope('model'):
                 nn = tf.keras.Sequential([
-                                        tfp.layers.DenseFlipout(20, activation = tf.nn.relu),
-                                        tfp.layers.DenseFlipout(10, activation = tf.nn.relu),
-                                        tfp.layers.DenseFlipout( 2, activation = None),
+                                        PlanarFlowDense(20, activation = tf.nn.relu, n_planar_flows = self.n_planar_flows),
+                                        PlanarFlowDense(10, activation = tf.nn.relu, n_planar_flows = self.n_planar_flows),
+                                        PlanarFlowDense( 2, activation = None,       n_planar_flows = self.n_planar_flows),
                                         ], name = 'nn')
                 logits = tf.identity(nn(x), name = 'logits')
                 pred_distribution = tfp.distributions.Categorical(logits = logits)
@@ -96,15 +163,18 @@ class VIBNN_NF(object):
                 acc = tf.reduce_mean(tf.cast(tf.equal(pred, y[:,0]), tf.float32), name = 'acc')
                 kldiv = tf.identity(sum(nn.losses)/self.N, name = 'kldiv')
                 elbo = tf.identity(logprob - kldiv, name = 'elbo')
-                qmu = {}
-                qstd = {}
+                Wmu = {}
+                Wstd = {}
+                bmu = {}
+                bstd = {}
                 for i, layer in enumerate(nn.layers):
                     try:
-                        q = layer.kernel_posterior
+                        Wmu[i] = layer.W.mean()
+                        Wstd[i] = layer.W.stddev()
+                        bmu[i] = layer.b.mean()
+                        bstd[i] = layer.b.stddev()
                     except AttributeError:
                         continue
-                    qmu[i] = q.mean()
-                    qstd[i] = q.stddev()
                 opt = tf.train.AdamOptimizer(learning_rate = 0.01)
                 train_op = opt.minimize(-elbo, name = 'train_op')
             init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer(), name = 'init_op')
@@ -291,7 +361,7 @@ def main():
                        help='Test the network.')
     args = parser.parse_args()
     
-    vibnn = VIBNN(network_dir = args.network_dir,
+    vibnn = VIBNN_NF(network_dir = args.network_dir,
                   result_dir = args.result_dir)
     vibnn.load_data(args.input)
 
